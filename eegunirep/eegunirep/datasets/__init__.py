@@ -1,0 +1,1 @@
+from ._vicreg_dataset import VicRegDataset

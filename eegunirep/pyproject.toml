@@ -1,0 +1,26 @@
+[tool.poetry]
+name = "eegunirep"
+version = "0.0.0"
+description = ""
+authors = ["Martyna Poziomska", "Jarosław Żywierewicz", "Jacek Rogala"]
+
+[tool.poetry-dynamic-versioning]
+enable = true
+
+[tool.poetry.scripts]
+
+[tool.poetry.dependencies]
+python = "~3.11"
+torch = "^2.5.0"
+torchmetrics = "^1.5.1"
+mne = "1.8.0"
+torchaudio = "^2.5.0"
+marimo = "^0.9.14"
+notebook = "^7.2.2"
+scipy = "1.12.0"
+torchvision = "^0.20.1"
+
+[build-system]
+# mne_features requires numpy to be installed during setup phase, and fails if it's not installed
+requires = ["poetry-core~=1.2.0", "poetry-dynamic-versioning~=0.19"]
+build-backend = "poetry_dynamic_versioning.backend"
