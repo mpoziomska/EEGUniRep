@@ -1,0 +1,3 @@
+[submodule "torcheeg"]
+	path = torcheeg
+	url = git@github.com:mpoziomska/torcheeg.git
