@@ -1,0 +1,66 @@
+[general]
+seed = 357
+workers = 30
+exp_id = "COV_0_one_trans_lr_2_std_1_repr_20"
+runs_pth = "/dmj/fizmed/mpoziomska/ELMIKO/DOKTORAT/EEGUniRep/runs"
+
+[feature_classification]
+make_classification = true
+epoch_stride = 5
+cls = "patient_sex"
+n_splits = 5
+
+[preprocess]
+new_Fs = 128
+f_stop = 64
+f_pass = 40
+tmin_s = 120
+tmax_s = 1800
+n_chans = 19
+
+[transformations]
+filters_pth = "/dmj/fizmed/mpoziomska/ELMIKO/DOKTORAT/EEGUniRep/eegunirep/eegunirep/transforms/utils/filters.json"
+len_crop_s = 6
+static_start_cut = 30
+num_crops = 30
+min_mask_len_perc = 0.1
+max_mask_len_perc = 0.9
+min_rect_len_perc = 0.1
+max_rect_len_perc = 0.9
+normalize = true
+min_rect_amp = 400
+max_rect_amp = 800
+noise_mean = 0
+noise_std = 10
+noise_p = 0.2
+cut_marigin_s = 1
+
+[training]
+epochs = 1000
+n_splits = 5
+train_batch_size = 128
+eval_batch_size = 128
+base_lr = 0.2
+
+[model]
+sim_coeff = 20
+std_coeff = 1
+cov_coeff = 0
+mlp_len_list = [ 8192, 8192, 8192,]
+attention_mode = "cbam"
+
+[neptune]
+project = "EEGUniRep/VicReg"
+api_token = "eyJhcGlfYWRkcmVzcyI6Imh0dHBzOi8vYXBwLm5lcHR1bmUuYWkiLCJhcGlfdXJsIjoiaHR0cHM6Ly9hcHAubmVwdHVuZS5haSIsImFwaV9rZXkiOiIzYjc4MGY4ZC0yOGE5LTQ4YTYtYmI1MC1kNDdjMDMzM2Q5NDUifQ=="
+
+[feature_classification.model]
+name = "catboost"
+iterations = 1000
+
+[model.feature_extractor]
+n_temporal_filters = 40
+temp_filter_length_inp = 16
+spatial_expansion = 1
+
+[model.channel_attention]
+temp_filter_length = 15

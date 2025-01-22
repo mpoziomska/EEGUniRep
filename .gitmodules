@@ -1,3 +1,6 @@
 [submodule "torcheeg"]
 	path = torcheeg
 	url = git@github.com:mpoziomska/torcheeg.git
+[submodule "braindecode"]
+	path = braindecode
+	url = https://github.com/braindecode/braindecode.git

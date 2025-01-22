@@ -1,4 +1,5 @@
 import numpy as np
+import mne
 
 CHNAMES_MAPPING = [
     {
@@ -95,7 +96,7 @@ CHNAMES_MAPPING = [
 CHAN_LIST = list(CHNAMES_MAPPING[0].values())
 
 
-CHANNEL_POSITION_MATRIX = np.array(
+CHANNEL_POSITION_MATRIX_names = np.array(
     [
         ["", "Fp1", "", "Fp2", ""],
         ["F7", "F3", "Fz", "F4", "F8"],
@@ -106,3 +107,32 @@ CHANNEL_POSITION_MATRIX = np.array(
     dtype="str",
 )
 
+
+CHANNEL_POSITION_MATRIX_idx = np.array([[-1,  0, -1,  1, -1],
+       [ 2,  3,  4,  5,  6],
+       [ 7,  8,  9, 10, 11],
+       [12, 13, 14, 15, 16],
+       [-1, 17, -1, 18, -1]])
+
+def apply_mor_data_hack_fix(edf, edf_path, institution_id):
+
+    # mor institution has a bad channel units for one channel, should be microvolts
+    # applying this hack fixes it, maybe without breaking anything else
+    # will not work during appraisal if institution not given
+
+    # we don't want fail while testing for the bad channel
+    # hence nested ifs
+    
+    if institution_id == 'MOR':
+        mor_bad_channel = 'Fz_nowe'
+        bad_channel_exists = mor_bad_channel in edf.ch_names
+        if bad_channel_exists:
+            bad_unit_in_channel = edf._orig_units[mor_bad_channel] == 'n/a'
+            if bad_unit_in_channel:
+                fixed_edf = mne.io.read_raw_edf(edf_path, preload=False)
+                bad_channel_id = edf.ch_names.index(mor_bad_channel)
+                fixed_edf._raw_extras[0]['units'][bad_channel_id] = 1.e-06
+                fixed_edf._orig_units[mor_bad_channel] = 'µV'
+                fixed_edf.load_data()
+                return fixed_edf
+    return edf

@@ -1,0 +1,617 @@
+from __future__ import annotations
+
+import numpy as np
+from einops.layers.torch import Rearrange
+from torch import nn
+
+import torch
+
+from braindecode.models.base import EEGModuleMixin
+from braindecode.models.modules import Ensure4d
+from braindecode.models.modules_attention import (
+    CAT,
+    CATLite,
+    CBAM,
+    ECA,
+    EncNet,
+    FCA,
+    GatherExcite,
+    GCT,
+    GSoP,
+    SqueezeAndExcitation,
+    SRM,
+)
+
+from eegunirep.models import TransformerEncoderLayer
+from eegunirep.utils.utils import get_debug_info
+
+
+class _FeatureExtractor(nn.Module):
+    """
+    A module for feature extraction of the data with temporal and spatial
+    transformations.
+
+    This module sequentially processes the input through a series of layers:
+    rearrangement, temporal convolution, batch normalization, spatial convolution,
+    another batch normalization, an ELU non-linearity, average pooling, and dropout.
+
+
+    Parameters
+    ----------
+    n_chans : int
+        The number of channels in the input data.
+    n_temporal_filters : int, optional
+        The number of filters to use in the temporal convolution layer. Default is 40.
+    temporal_filter_length : int, optional
+        The size of each filter in the temporal convolution layer. Default is 25.
+    spatial_expansion : int, optional
+        The expansion factor of the spatial convolution layer, determining the number
+        of output channels relative to the number of temporal filters. Default is 1.
+    pool_length : int, optional
+        The size of the window for the average pooling operation. Default is 75.
+    pool_stride : int, optional
+        The stride of the average pooling operation. Default is 15.
+    drop_prob : float, optional
+        The dropout rate for regularization. Default is 0.5.
+    activation: nn.Module, default=nn.ELU
+        Activation function class to apply. Should be a PyTorch activation
+        module class like ``nn.ReLU`` or ``nn.ELU``. Default is ``nn.ELU``.
+    """
+
+    def __init__(
+        self,
+        config,
+        logger,
+        n_chans: int = 19,
+        drop_prob: float = 0.5,
+        activation: nn.Module = nn.ELU,
+    ):
+        super().__init__()
+        n_temporal_filters = config['n_temporal_filters']
+        temporal_filter_length = config['temp_filter_length_inp']
+        spatial_expansion = config['spatial_expansion']
+        self.logger = logger
+        self.ensure4d = Ensure4d()
+        self.rearrange_input = Rearrange("b c s t -> (b s) 1 c t") 
+        self.temporal_conv = nn.Conv2d(
+            1,
+            n_temporal_filters,
+            kernel_size=(1, temporal_filter_length),
+            # padding=(0, temporal_filter_length // 2),
+            stride=(1, temporal_filter_length),
+            bias=False,
+        )
+        self.intermediate_bn = nn.BatchNorm2d(n_temporal_filters)
+        self.spatial_conv = nn.Conv2d(
+            n_temporal_filters,
+            n_temporal_filters * spatial_expansion,
+            kernel_size=(n_chans, 1),
+            groups=n_temporal_filters,
+            bias=False,
+        )
+        self.bn = nn.BatchNorm2d(n_temporal_filters * spatial_expansion)
+        self.nonlinearity = activation()
+        # self.pool = nn.AvgPool2d((1, pool_length), stride=(1, pool_stride))
+        self.dropout = nn.Dropout(drop_prob)
+
+    def forward(self, x):
+        self.logger.debug(f"\t\tFEAT input {get_debug_info(x)}") # b, 19, 30, 768
+        x = self.ensure4d(x)
+        x = self.rearrange_input(x)
+        self.logger.debug(f"\t\tFEAT rearrange_input {get_debug_info(x)}") # b * 30, 1, 19, 768
+        x = self.temporal_conv(x)
+        self.logger.debug(f"\t\tFEAT temporal_conv {get_debug_info(x)}")  # b * 30, 40, 19, 48
+        x = self.intermediate_bn(x)
+
+        x = self.spatial_conv(x)
+
+
+        self.logger.debug(f"\t\tFEAT spatial_conv {get_debug_info(x)}")  # b * 30, 40, 1, 48
+        x = self.bn(x)
+
+        x = self.nonlinearity(x)
+
+        # x = self.pool(x)
+        x = self.dropout(x)
+        return x
+
+
+class _ChannelAttentionBlock(nn.Module):
+    """
+    A neural network module implementing channel-wise attention mechanisms to enhance
+    feature representations by selectively emphasizing important channels and suppressing
+    less useful ones. This block integrates convolutional layers, pooling, dropout, and
+    an optional attention mechanism that can be customized based on the given mode.
+
+    Parameters
+    ----------
+    attention_mode : str, optional
+        The type of attention mechanism to apply. If `None`, no attention is applied.
+        - "se" for Squeeze-and-excitation network
+        - "gsop" for Global Second-Order Pooling
+        - "fca" for Frequency Channel Attention Network
+        - "encnet" for context encoding module
+        - "eca" for Efficient channel attention for deep convolutional neural networks
+        - "ge" for Gather-Excite
+        - "gct" for Gated Channel Transformation
+        - "srm" for Style-based Recalibration Module
+        - "cbam" for Convolutional Block Attention Module
+        - "cat" for Learning to collaborate channel and temporal attention
+        from multi-information fusion
+        - "catlite" for Learning to collaborate channel attention
+        from multi-information fusion (lite version, cat w/o temporal attention)
+
+    in_channels : int, default=16
+        The number of input channels to the block.
+    temp_filter_length : int, default=15
+        The length of the temporal filters in the convolutional layers.
+    pool_length : int, default=8
+        The length of the window for the average pooling operation.
+    pool_stride : int, default=8
+        The stride of the average pooling operation.
+    drop_prob : float, default=0.5
+        The dropout rate for regularization. Values should be between 0 and 1.
+    reduction_rate : int, default=4
+        The reduction rate used in the attention mechanism to reduce dimensionality
+        and computational complexity.
+    use_mlp : bool, default=False
+        Flag to indicate whether an MLP (Multi-Layer Perceptron) should be used within
+        the attention mechanism for further processing.
+    seq_len : int, default=62
+        The sequence length, used in certain types of attention mechanisms to process
+        temporal dimensions.
+    freq_idx : int, default=0
+        DCT index used in fca attention mechanism.
+    n_codewords : int, default=4
+        The number of codewords (clusters) used in attention mechanisms that employ
+        quantization or clustering strategies.
+    kernel_size : int, default=9
+        The kernel size used in certain types of attention mechanisms for convolution
+        operations.
+    extra_params : bool, default=False
+        Flag to indicate whether additional, custom parameters should be passed to
+        the attention mechanism.
+    activation: nn.Module, default=nn.ELU
+        Activation function class to apply. Should be a PyTorch activation
+        module class like ``nn.ReLU`` or ``nn.ELU``. Default is ``nn.ELU``.
+
+    Attributes
+    ----------
+    conv : torch.nn.Sequential
+        Sequential model of convolutional layers, batch normalization, and ELU
+        activation, designed to process input features.
+    pool : torch.nn.AvgPool2d
+        Average pooling layer to reduce the dimensionality of the feature maps.
+    dropout : torch.nn.Dropout
+        Dropout layer for regularization.
+    attention_block : torch.nn.Module or None
+        The attention mechanism applied to the output of the convolutional layers,
+        if `attention_mode` is not None. Otherwise, it's set to None.
+    activation: nn.Module, default=nn.ELU
+        Activation function class to apply. Should be a PyTorch activation
+        module class like ``nn.ReLU`` or ``nn.ELU``. Default is ``nn.ELU``.
+
+    Examples
+    --------
+    >>> channel_attention_block = _ChannelAttentionBlock(attention_mode='cbam', in_channels=16, reduction_rate=4, kernel_size=7)
+    >>> x = torch.randn(1, 16, 64, 64)  # Example input tensor
+    >>> output = channel_attention_block(x)
+    The output tensor then can be further processed or used as input to another block.
+
+    """
+
+    def __init__(
+        self,
+        logger,
+        attention_mode: str | None = None,
+        in_channels: int = 19,
+        temp_filter_length: int = 15,
+        pool_length: int = 8,
+        pool_stride: int = 8,
+        drop_prob: float = 0.5,
+        reduction_rate: int = 4,
+        use_mlp: bool = False,
+        seq_len: int = 62,
+        freq_idx: int = 0,
+        n_codewords: int = 4,
+        kernel_size: int = 9,
+        extra_params: bool = False,
+        activation: nn.Module = nn.ELU,
+    ):
+        super().__init__()
+        self.logger = logger
+        self.conv = nn.Sequential(
+            nn.Conv2d(
+                in_channels,
+                in_channels,
+                (1, temp_filter_length),
+                padding=(0, temp_filter_length // 2),
+                bias=False,
+                groups=in_channels,
+            ),
+            nn.Conv2d(in_channels, in_channels, (1, 1), bias=False),
+            nn.BatchNorm2d(in_channels),
+            activation(),
+        )
+
+        self.pool = nn.AvgPool2d((1, pool_length), stride=(1, pool_stride))
+        self.dropout = nn.Dropout(drop_prob)
+
+        if attention_mode is not None:
+            self.attention_block = get_attention_block(
+                attention_mode,
+                ch_dim=in_channels,
+                reduction_rate=reduction_rate,
+                use_mlp=use_mlp,
+                seq_len=seq_len,
+                freq_idx=freq_idx,
+                n_codewords=n_codewords,
+                kernel_size=kernel_size,
+                extra_params=extra_params,
+            )
+        else:
+            self.attention_block = None
+
+    def forward(self, x):
+        self.logger.debug(f"\t\tATT input {get_debug_info(x)}") # b * 30, 16, 1, 48
+        x = self.conv(x)
+        self.logger.debug(f"\t\tATT conv {get_debug_info(x)}")# b * 30, 16, 1, 48
+        if self.attention_block is not None:
+            x = self.attention_block(x)
+        self.logger.debug(f"\t\tATT attention_block {get_debug_info(x)}") # b * 30, 16, 1, 48
+        x = self.pool(x)
+        self.logger.debug(f"\t\tATT pool {get_debug_info(x)}") # b * 30, 16, 1, 6
+        x = self.dropout(x)
+        return x
+
+
+class AttentionBaseNet(EEGModuleMixin, nn.Module):
+    """AttentionBaseNet from Wimpff M et al. (2023) [Martin2023]_.
+
+    .. figure:: https://content.cld.iop.org/journals/1741-2552/21/3/036020/revision2/jnead48b9f2_hr.jpg
+       :align: center
+       :alt: Attention Base Net
+
+    Neural Network from the paper: EEG motor imagery decoding:
+    A framework for comparative analysis with channel attention
+    mechanisms
+
+    The paper and original code with more details about the methodological
+    choices are available at the [Martin2023]_ and [MartinCode]_.
+
+    The AttentionBaseNet architecture is composed of four modules:
+    - Input Block that performs a temporal convolution and a spatial
+    convolution.
+    - Channel Expansion that modifies the number of channels.
+    - An attention block that performs channel attention with several
+    options
+    - ClassificationHead
+
+    .. versionadded:: 0.9
+
+    Parameters
+    ----------
+    n_temporal_filters : int, optional
+        Number of temporal convolutional filters in the first layer. This defines
+        the number of output channels after the temporal convolution.
+        Default is 40.
+    temp_filter_length : int, default=15
+        The length of the temporal filters in the convolutional layers.
+    spatial_expansion : int, optional
+        Multiplicative factor to expand the spatial dimensions. Used to increase
+        the capacity of the model by expanding spatial features. Default is 1.
+    pool_length_inp : int, optional
+        Length of the pooling window in the input layer. Determines how much
+        temporal information is aggregated during pooling. Default is 75.
+    pool_stride_inp : int, optional
+        Stride of the pooling operation in the input layer. Controls the
+        downsampling factor in the temporal dimension. Default is 15.
+    drop_prob_inp : float, optional
+        Dropout rate applied after the input layer. This is the probability of
+        zeroing out elements during training to prevent overfitting.
+        Default is 0.5.
+    ch_dim : int, optional
+        Number of channels in the subsequent convolutional layers. This controls
+        the depth of the network after the initial layer. Default is 16.
+    attention_mode : str, optional
+        The type of attention mechanism to apply. If `None`, no attention is applied.
+        - "se" for Squeeze-and-excitation network
+        - "gsop" for Global Second-Order Pooling
+        - "fca" for Frequency Channel Attention Network
+        - "encnet" for context encoding module
+        - "eca" for Efficient channel attention for deep convolutional neural networks
+        - "ge" for Gather-Excite
+        - "gct" for Gated Channel Transformation
+        - "srm" for Style-based Recalibration Module
+        - "cbam" for Convolutional Block Attention Module
+        - "cat" for Learning to collaborate channel and temporal attention
+        from multi-information fusion
+        - "catlite" for Learning to collaborate channel attention
+        from multi-information fusion (lite version, cat w/o temporal attention)
+    pool_length : int, default=8
+        The length of the window for the average pooling operation.
+    pool_stride : int, default=8
+        The stride of the average pooling operation.
+    drop_prob_attn : float, default=0.5
+        The dropout rate for regularization for the attention layer. Values should be between 0 and 1.
+    reduction_rate : int, default=4
+        The reduction rate used in the attention mechanism to reduce dimensionality
+        and computational complexity.
+    use_mlp : bool, default=False
+        Flag to indicate whether an MLP (Multi-Layer Perceptron) should be used within
+        the attention mechanism for further processing.
+    freq_idx : int, default=0
+        DCT index used in fca attention mechanism.
+    n_codewords : int, default=4
+        The number of codewords (clusters) used in attention mechanisms that employ
+        quantization or clustering strategies.
+    kernel_size : int, default=9
+        The kernel size used in certain types of attention mechanisms for convolution
+        operations.
+    activation: nn.Module, default=nn.ELU
+        Activation function class to apply. Should be a PyTorch activation
+        module class like ``nn.ReLU`` or ``nn.ELU``. Default is ``nn.ELU``.
+    extra_params : bool, default=False
+        Flag to indicate whether additional, custom parameters should be passed to
+        the attention mechanism.
+
+    References
+    ----------
+    .. [Martin2023] Wimpff, M., Gizzi, L., Zerfowski, J. and Yang, B., 2023.
+        EEG motor imagery decoding: A framework for comparative analysis with
+        channel attention mechanisms. arXiv preprint arXiv:2310.11198.
+    .. [MartinCode] Wimpff, M., Gizzi, L., Zerfowski, J. and Yang, B.
+        GitHub https://github.com/martinwimpff/channel-attention (accessed 2024-03-28)
+    """
+
+    def __init__(
+        self,
+        config,
+        device,
+        logger, 
+        n_times=None,
+        n_outputs=None,
+        chs_info=None,
+        # Module parameters
+        pool_length_inp: int = 75,
+        pool_stride_inp: int = 15,
+        drop_prob_inp: float = 0.5,
+        ch_dim: int = 16,
+        pool_length: int = 8,
+        pool_stride: int = 8,
+        drop_prob_attn: float = 0.5,
+        # attention_mode: str | None = None,
+        reduction_rate: int = 4,
+        use_mlp: bool = False,
+        freq_idx: int = 0,
+        n_codewords: int = 4,
+        kernel_size: int = 9,
+        activation: nn.Module = nn.ELU,
+        extra_params: bool = False,
+        dtype = torch.float32,
+    ):
+        self.logger = logger
+
+        self.device = device
+        self.dtype = dtype
+        sfreq = config['preprocess']['new_Fs']
+        input_window_seconds = config['transformations']['len_crop_s']
+        self.num_crops = config['transformations']['num_crops']
+        n_chans = config['preprocess']['n_chans']
+        attention_mode = config['model']['attention_mode']
+        super(AttentionBaseNet, self).__init__()
+
+        super().__init__(
+            n_outputs=n_outputs,
+            n_chans=n_chans,
+            chs_info=chs_info,
+            n_times=n_times,
+            sfreq=sfreq,
+            input_window_seconds=input_window_seconds,
+        )
+        del n_outputs, n_chans, chs_info, n_times, sfreq, input_window_seconds
+
+        self.rearrange1 = Rearrange("bs c 1 f -> bs 1 (c f)")
+        self.rearrange2 = Rearrange("b s f -> b s 1 f")
+        self.rearrange3 = Rearrange("b s f -> b (s f)")
+
+        self.input_block = _FeatureExtractor(
+            logger=self.logger,
+            n_chans=self.n_chans,
+            config=config['model']['feature_extractor'],
+            drop_prob=drop_prob_inp,
+            activation=activation,
+        ).to(device=self.device, dtype=self.dtype)
+
+        self.channel_expansion = nn.Sequential(
+            nn.Conv2d(
+                config['model']['feature_extractor']['n_temporal_filters'] * config['model']['feature_extractor']['spatial_expansion'], ch_dim, (1, 1), bias=False
+            ),
+            nn.BatchNorm2d(ch_dim),
+            activation(),
+        ).to(device=self.device, dtype=self.dtype)
+
+        seq_lengths = self._calculate_sequence_lengths(
+            self.n_times,
+            [config['model']['feature_extractor']['temp_filter_length_inp'], config['model']['channel_attention']['temp_filter_length']],
+            [pool_length_inp, pool_length],
+            [pool_stride_inp, pool_stride],
+        )
+        self.channel_attention_block = _ChannelAttentionBlock(
+            logger=self.logger,
+            attention_mode=attention_mode,
+            in_channels=ch_dim,
+            temp_filter_length=config['model']['channel_attention']['temp_filter_length'],
+            pool_length=pool_length,
+            pool_stride=pool_stride,
+            drop_prob=drop_prob_attn,
+            reduction_rate=reduction_rate,
+            use_mlp=use_mlp,
+            seq_len=seq_lengths[0],
+            freq_idx=freq_idx,
+            n_codewords=n_codewords,
+            kernel_size=kernel_size,
+            extra_params=extra_params,
+            activation=activation,
+        ).to(device=self.device, dtype=self.dtype)
+
+        self.attention_TR1 = TransformerEncoderLayer(d_model=96, nhead=4, batch_first=True, add_rot_pos_emb='rel').to(device=self.device, dtype=self.dtype)
+        self.attention_TR2 = TransformerEncoderLayer(d_model=96, nhead=4, batch_first=True, add_rot_pos_emb='rel').to(device=self.device, dtype=self.dtype)
+        self.attention_TR3 = TransformerEncoderLayer(d_model=96, nhead=4, batch_first=True, add_rot_pos_emb='rel').to(device=self.device, dtype=self.dtype)
+
+        self.norm1 = nn.LayerNorm(96).to(device=self.device, dtype=self.dtype)
+        self.norm2 = nn.LayerNorm(96).to(device=self.device, dtype=self.dtype)
+        self.norm3 = nn.LayerNorm(96).to(device=self.device, dtype=self.dtype)
+
+        self.calculate_output_len()
+
+
+        
+    def forward(self, x, batch_size):
+        self.logger.debug(f"\tAttentionBaseNet")
+        self.logger.debug(f"\tinput {get_debug_info(x)}") #b, 19, 30, 768
+        x = self.input_block(x)
+        self.logger.debug(f"\tinput_block {get_debug_info(x)}") # b * 30, 40, 1, 49
+
+        x = self.channel_expansion(x)
+        self.logger.debug(f"\tchannel_expansion {get_debug_info(x)}") # b * 30, 16, 1, 49
+
+        x = self.channel_attention_block(x)
+        self.logger.debug(f"\tchannel_attention_block {get_debug_info(x)}") # b * 30, 16, 1, 6
+
+        x = self.rearrange1(x)
+        self.logger.debug(f"\trearrange1 {get_debug_info(x)}") # b * 30, 1, 96
+        x = x.reshape(batch_size, self.num_crops, -1)
+        self.logger.debug(f"\treshape {get_debug_info(x)}") # b, 30, 96
+
+        x = x + self.norm1(self.attention_TR1(x))
+        self.logger.debug(f"\tattention_TR1 {get_debug_info(x)}") # b, 30, 96
+
+        # x = x + self.norm2(self.attention_TR2(x))
+
+        # self.logger.debug(f"\tattention_TR2 {get_debug_info(x)}") # b, 30, 96
+
+        # x = x + self.norm3(self.attention_TR3(x))
+
+        # self.logger.debug(f"\tattention_TR3 {get_debug_info(x)}") # b, 30, 96
+
+        x = self.rearrange3(x)
+        self.logger.debug(f"\trearrange3 {get_debug_info(x)}") # b, 2880
+
+        return x
+
+    def calculate_output_len(self):
+        batch_size = 2
+        x = torch.ones([batch_size, self.n_chans, self.num_crops, int(self.sfreq * self.input_window_seconds)]).to(device=self.device, dtype=self.dtype)
+        output = self.forward(x, batch_size)
+        self.out_enc = output.shape[-1]
+    
+    @staticmethod
+    def _calculate_sequence_lengths(
+        input_window_samples: int,
+        kernel_lengths: list,
+        pool_lengths: list,
+        pool_strides: list,
+    ):
+        seq_lengths = []
+        out = input_window_samples
+        for k, pl, ps in zip(kernel_lengths, pool_lengths, pool_strides):
+            out = np.floor(out + 2 * (k // 2) - k + 1)
+            out = np.floor((out - pl) / ps + 1)
+            seq_lengths.append(int(out))
+        return seq_lengths
+
+
+def get_attention_block(
+    attention_mode: str,
+    ch_dim: int = 16,
+    reduction_rate: int = 4,
+    use_mlp: bool = False,
+    seq_len: int | None = None,
+    freq_idx: int = 0,
+    n_codewords: int = 4,
+    kernel_size: int = 9,
+    extra_params: bool = False,
+):
+    """
+    Util function to the attention block based on the attention mode.
+
+    Parameters
+    ----------
+    attention_mode: str
+        The type of attention mechanism to apply.
+    ch_dim: int
+        The number of input channels to the block.
+    reduction_rate: int
+        The reduction rate used in the attention mechanism to reduce
+        dimensionality and computational complexity.
+        Used in all the methods, except for the
+        encnet and eca.
+    use_mlp: bool
+        Flag to indicate whether an MLP (Multi-Layer Perceptron) should be used
+        within the attention mechanism for further processing. Used in the ge
+        and srm attention mechanism.
+    seq_len: int
+        The sequence length, used in certain types of attention mechanisms to
+        process temporal dimensions. Used in the ge or fca attention mechanism.
+    freq_idx: int
+        DCT index used in fca attention mechanism.
+    n_codewords: int
+        The number of codewords (clusters) used in attention mechanisms
+        that employ quantization or clustering strategies, encnet.
+    kernel_size: int
+        The kernel size used in certain types of attention mechanisms for convolution
+        operations, used in the cbam, eca, and cat attention mechanisms.
+    extra_params: bool
+        Parameter to pass additional parameters to the GatherExcite mechanism.
+
+    Returns
+    -------
+    nn.Module
+        The attention block based on the attention mode.
+    """
+    if attention_mode == "se":
+        return SqueezeAndExcitation(in_channels=ch_dim, reduction_rate=reduction_rate)
+    # improving the squeeze module
+    elif attention_mode == "gsop":
+        return GSoP(in_channels=ch_dim, reduction_rate=reduction_rate)
+    elif attention_mode == "fca":
+        assert seq_len is not None
+        return FCA(
+            in_channels=ch_dim,
+            seq_len=seq_len,
+            reduction_rate=reduction_rate,
+            freq_idx=freq_idx,
+        )
+    elif attention_mode == "encnet":
+        return EncNet(in_channels=ch_dim, n_codewords=n_codewords)
+    # improving the excitation module
+    elif attention_mode == "eca":
+        return ECA(in_channels=ch_dim, kernel_size=kernel_size)
+    # improving the squeeze and the excitation module
+    elif attention_mode == "ge":
+        assert seq_len is not None
+        return GatherExcite(
+            in_channels=ch_dim,
+            seq_len=seq_len,
+            extra_params=extra_params,
+            use_mlp=use_mlp,
+            reduction_rate=reduction_rate,
+        )
+    elif attention_mode == "gct":
+        return GCT(in_channels=ch_dim)
+    elif attention_mode == "srm":
+        return SRM(in_channels=ch_dim, use_mlp=use_mlp, reduction_rate=reduction_rate)
+    # temporal and channel attention
+    elif attention_mode == "cbam":
+        return CBAM(
+            in_channels=ch_dim, reduction_rate=reduction_rate, kernel_size=kernel_size
+        )
+    elif attention_mode == "cat":
+        return CAT(
+            in_channels=ch_dim, reduction_rate=reduction_rate, kernel_size=kernel_size
+        )
+    elif attention_mode == "catlite":
+        return CATLite(ch_dim, reduction_rate=reduction_rate)
+    else:
+        raise NotImplementedError
